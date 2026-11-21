@@ -130,6 +130,9 @@ This document describes the configuration directives common to all the protocols
 <li><a href="configure/base_directives.html#pid-file">
 <code>pid-file</code>
 </a></li>
+<li><a href="configure/base_directives.html#tcp-accept-handoff">
+<code>tcp-accept-handoff</code>
+</a></li>
 <li><a href="configure/base_directives.html#tcp-fastopen">
 <code>tcp-fastopen</code>
 </a></li>
@@ -450,7 +453,7 @@ Default is 4.
 <dt id="minimum-version">minimum-version:</dt>
 <dd>
 minimum protocol version, should be one of: <code>SSLv2</code>, <code>SSLv3</code>, <code>TLSv1</code>, <code>TLSv1.1</code>, <code>TLSv1.2</code>, <code>TLSv1.3</code>.
-Default is <code>TLSv1</code>.
+Default is <code>TLSv1.2</code>.
 </dd>
 <dt id="min-version">min-version:</dt>
 <dd>
@@ -1129,6 +1132,30 @@ Default is none.
 </dd>
 <dt><a href="configure/syntax_and_structure.html#config_levels">Level</a>:</dt>
 <dd>global</dd>
+</dl>
+
+<div id="tcp-accept-handoff" class="directive-head">
+<h3><a href="configure/base_directives.html#tcp-accept-handoff"><code>"tcp-accept-handoff"</code></a></h3>
+</div>
+
+<dl class="directive-desc">
+<dt>Description:</dt>
+<dd>
+<p>
+Allows workers to hand newly accepted TCP connections to less loaded workers.
+</p>
+
+<p>
+With <code>ON</code>, workers use their counts of open sockets and pending handoffs to compare load.
+When an accepting worker has substantially more connections than a sampled peer, it can pass the socket to that peer before TLS or HTTP processing begins.
+If the peer's handoff queue is full, the accepting worker can continue serving connections locally.
+</p>
+
+</dd>
+<dt><a href="configure/syntax_and_structure.html#config_levels">Level</a>:</dt>
+<dd>global</dd>
+<dt>Default:</dt>
+<dd><code><pre>tcp-accept-handoff: OFF</pre></code>
 </dl>
 
 <div id="tcp-fastopen" class="directive-head">

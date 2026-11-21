@@ -43,21 +43,24 @@ hosts:
       format: "%{thread-index}x %h"
 EOT
 
-        my @clients = map { connect_client($port) } 1..48;
-        my $overflow = connect_client($port);
+        my @clients = map { connect_client($port, $use_tls) } 1..48;
+        write_request($_, "GET /index.txt HTTP/1.0\r\n") for @clients;
+        my $overflow = connect_client($port, 0);
         if (!$use_tls) {
-            write_request($_, "GET /index.txt HTTP/1.0\r\n") for @clients;
             write_request($overflow, "GET /index.txt HTTP/1.0\r\n\r\n");
             ok !IO::Select->new($overflow)->can_read(0.2), 'connection limit holds';
         }
 
         for my $i (0..$#clients) {
             my $client = $clients[$i];
-            finish_request($client, $use_tls);
+            write_request($client, "\r\n");
             check_response($client, $i + 1);
             # The first response releases one slot while the other clients remain connected.
             if ($i == 0) {
-                finish_request($overflow, 1) if $use_tls;
+                if ($use_tls) {
+                    start_tls($overflow);
+                    write_request($overflow, "GET /index.txt HTTP/1.0\r\n\r\n");
+                }
                 check_response($overflow, 'connection limit recovered');
             }
         }
@@ -86,21 +89,17 @@ EOT
 done_testing;
 
 sub connect_client {
-    my ($port) = @_;
+    my ($port, $use_tls) = @_;
     my $client = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $port, Proto => 'tcp', Timeout => 5)
         or die "connecting to port $port: $!";
+    start_tls($client) if $use_tls;
     return $client;
 }
 
-sub finish_request {
-    my ($client, $use_tls) = @_;
-    if ($use_tls) {
-        IO::Socket::SSL->start_SSL($client, SSL_verify_mode => SSL_VERIFY_NONE)
-            or die "starting TLS: " . IO::Socket::SSL::errstr();
-        write_request($client, "GET /index.txt HTTP/1.0\r\n\r\n");
-    } else {
-        write_request($client, "\r\n");
-    }
+sub start_tls {
+    my ($client) = @_;
+    IO::Socket::SSL->start_SSL($client, SSL_verify_mode => SSL_VERIFY_NONE)
+        or die "starting TLS: " . IO::Socket::SSL::errstr();
 }
 
 sub write_request {
