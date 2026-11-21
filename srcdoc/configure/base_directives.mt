@@ -742,6 +742,21 @@ Default is none.
 
 <?
 $ctx->{directive}->(
+    name    => "tcp-accept-handoff",
+    levels  => [ qw(global) ],
+    default => "tcp-accept-handoff: OFF",
+    desc    => q{Allows workers to hand newly accepted TCP connections to less loaded workers.},
+)->(sub {
+?>
+<p>
+With <code>ON</code>, workers use their counts of open sockets and pending handoffs to compare load.
+When an accepting worker has substantially more connections than a sampled peer, it can pass the socket to that peer before TLS or HTTP processing begins.
+If the peer's handoff queue is full, the accepting worker can continue serving connections locally.
+</p>
+? })
+
+<?
+$ctx->{directive}->(
     name   => "tcp-fastopen",
     levels => [ qw(global) ],
     desc   => q{Size of the queue used for TCP Fast Open.},

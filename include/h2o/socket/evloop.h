@@ -22,6 +22,7 @@
 #ifndef h2o__evloop_h
 #define h2o__evloop_h
 
+#include <netinet/in.h>
 #include "h2o/linklist.h"
 #include "h2o/timerwheel.h"
 
@@ -60,11 +61,29 @@ typedef h2o_evloop_t h2o_loop_t;
 typedef h2o_timerwheel_entry_t h2o_timer_t;
 typedef h2o_timerwheel_cb h2o_timer_cb;
 
+typedef struct st_h2o_evloop_accepted_socket_t {
+    int fd;
+    socklen_t peeraddrlen;
+    union {
+        struct sockaddr sa;
+        struct sockaddr_in sin4;
+        struct sockaddr_in6 sin6;
+    } peeraddr;
+} h2o_evloop_accepted_socket_t;
+
 extern size_t h2o_evloop_socket_max_read_size;
 extern size_t h2o_evloop_socket_max_write_size;
 
 h2o_socket_t *h2o_evloop_socket_create(h2o_evloop_t *loop, int fd, int flags);
 h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *listener);
+/**
+ * accepts a nonblocking, close-on-exec fd that can be passed to another event loop; returns -1 on failure
+ */
+int h2o_evloop_socket_accept_fd(h2o_socket_t *listener, h2o_evloop_accepted_socket_t *accepted);
+/**
+ * takes ownership of the accepted fd and initializes a socket on the specified loop
+ */
+h2o_socket_t *h2o_evloop_socket_create_accepted(h2o_evloop_t *loop, h2o_evloop_accepted_socket_t *accepted);
 /**
  * Sets number of bytes that can be read at once (default: 1MB).
  */

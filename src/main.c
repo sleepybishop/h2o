@@ -130,6 +130,11 @@
 
 #define H2O_DEFAULT_OCSP_UPDATER_MAX_THREADS 10
 
+#define ACCEPT_HANDOFF_MIN_LOAD 8
+#define ACCEPT_HANDOFF_LOAD_GAP 4
+#define ACCEPT_HANDOFF_PENDING_LIMIT 32
+#define ACCEPT_HANDOFF_ADOPT_BUDGET 8
+
 struct listener_ssl_parsed_identity_t {
     struct {
         char *str;
@@ -286,6 +291,8 @@ static struct {
     int max_quic_connections;
     int soft_connection_limit;
     int soft_connection_limit_min_age;
+    int tcp_accept_handoff;
+    int test_single_acceptor;
     /**
      * array size == number of worker threads to instantiate, the values indicate which CPU to pin, -1 if not
      */
@@ -302,6 +309,11 @@ static struct {
         h2o_context_t ctx;
         h2o_multithread_receiver_t server_notifications;
         h2o_multithread_receiver_t memcached;
+        h2o_multithread_receiver_t handoff_receiver;
+        h2o_linklist_t handoffs;
+        struct listener_ctx_t *listeners;
+        unsigned open_sockets;
+        unsigned pending_handoffs;
     } *threads;
     volatile sig_atomic_t shutdown_requested;
     h2o_barrier_t startup_sync_barrier_init;
@@ -3971,6 +3983,11 @@ static int on_tcp_reuseport(h2o_configurator_command_t *cmd, h2o_configurator_co
     return on_config_onoff(cmd, node, &conf.tcp_reuseport);
 }
 
+static int on_config_tcp_accept_handoff(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return on_config_onoff(cmd, node, &conf.tcp_accept_handoff);
+}
+
 static int on_config_ssl_offload(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     switch (h2o_configurator_get_one_of(cmd, node, "OFF,kernel,zerocopy")) {
@@ -4166,10 +4183,17 @@ static void dispose_resolve_tag_arg(resolve_tag_arg_t *arg)
 
 static void on_sigterm(int notify_threads)
 {
-    conf.shutdown_requested = 1;
+    int saved_errno = errno;
+    __atomic_store_n(&conf.shutdown_requested, 1, __ATOMIC_RELAXED);
     if (notify_threads)
         notify_all_threads();
     h2o_set_signal_handler(SIGTERM, SIG_IGN);
+    errno = saved_errno;
+}
+
+static int shutdown_requested(void)
+{
+    return __atomic_load_n(&conf.shutdown_requested, __ATOMIC_RELAXED);
 }
 
 static void on_sigterm_set_flag_only(int signo)
@@ -4510,7 +4534,141 @@ static void forwarded_quic_socket_on_read(h2o_socket_t *sock, const char *err)
 
 static void on_socketclose(void *data)
 {
+    if (data != NULL)
+        __atomic_sub_fetch((unsigned *)data, 1, __ATOMIC_RELAXED);
     num_connections(-1);
+}
+
+static void accept_connection(struct listener_ctx_t *ctx, h2o_evloop_accepted_socket_t *accepted)
+{
+    h2o_socket_t *sock = h2o_evloop_socket_create_accepted(ctx->accept_ctx.ctx->loop, accepted);
+    sock->on_close.cb = on_socketclose;
+    if (conf.tcp_accept_handoff) {
+        sock->on_close.data = &conf.threads[thread_index].open_sockets;
+        __atomic_add_fetch(&conf.threads[thread_index].open_sockets, 1, __ATOMIC_RELAXED);
+    }
+
+    struct listener_config_t *listener_config = conf.listeners[ctx->listener_index];
+    if (listener_config->sndbuf != 0 &&
+        setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_SNDBUF, &listener_config->sndbuf, sizeof(listener_config->sndbuf)) != 0)
+        h2o_perror("failed to set SO_SNDBUF");
+    if (listener_config->rcvbuf != 0 &&
+        setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_RCVBUF, &listener_config->rcvbuf, sizeof(listener_config->rcvbuf)) != 0)
+        h2o_perror("failed to set SO_RCVBUF");
+    set_tcp_congestion_controller(sock, listener_config->tcp_congestion_controller);
+
+    h2o_accept(&ctx->accept_ctx, sock);
+}
+
+struct accept_handoff_t {
+    h2o_multithread_message_t message;
+    h2o_evloop_accepted_socket_t accepted;
+    size_t listener_index;
+};
+
+struct accept_handoff_batch_t {
+    size_t worker;
+    h2o_linklist_t messages;
+};
+
+static unsigned accept_load(size_t worker)
+{
+    unsigned pending = __atomic_load_n(&conf.threads[worker].pending_handoffs, __ATOMIC_RELAXED);
+    return pending + __atomic_load_n(&conf.threads[worker].open_sockets, __ATOMIC_RELAXED);
+}
+
+static void sample_handoff_peers(struct accept_handoff_batch_t *batches, size_t count)
+{
+    /* draw from peers excluding the accepting worker; second draw also excludes the first */
+    size_t peers = conf.thread_map.size - 1;
+    size_t first = peers == 1 ? 0 : h2o_rand() % peers;
+    batches[0].worker = first + (first >= thread_index);
+    h2o_linklist_init_anchor(&batches[0].messages);
+    if (count == 2) {
+        size_t second = h2o_rand() % (peers - 1);
+        second += second >= first;
+        batches[1].worker = second + (second >= thread_index);
+        h2o_linklist_init_anchor(&batches[1].messages);
+    }
+}
+
+static int reserve_handoff(size_t worker)
+{
+    unsigned *pending = &conf.threads[worker].pending_handoffs;
+    unsigned count = __atomic_load_n(pending, __ATOMIC_RELAXED);
+    while (count < ACCEPT_HANDOFF_PENDING_LIMIT) {
+        if (__atomic_compare_exchange_n(pending, &count, count + 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    return 0;
+}
+
+static int enqueue_handoff(struct accept_handoff_batch_t *batches, size_t count, unsigned local_load, size_t listener_index,
+                           h2o_evloop_accepted_socket_t *accepted)
+{
+    unsigned loads[2] = {accept_load(batches[0].worker), 0};
+    size_t preferred = 0;
+    if (count == 2 && (loads[1] = accept_load(batches[1].worker)) < loads[0])
+        preferred = 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        size_t target = i == 0 ? preferred : 1 - preferred;
+        if (loads[target] + ACCEPT_HANDOFF_LOAD_GAP > local_load)
+            break;
+        if (!reserve_handoff(batches[target].worker))
+            continue;
+
+        struct accept_handoff_t *handoff = h2o_mem_alloc(sizeof(*handoff));
+        *handoff = (struct accept_handoff_t){.accepted = *accepted, .listener_index = listener_index};
+        accepted->fd = -1;
+        h2o_linklist_insert(&batches[target].messages, &handoff->message.link);
+        return 1;
+    }
+    return 0;
+}
+
+static int try_handoff_accepted(struct accept_handoff_batch_t *batches, size_t *batch_count, size_t listener_index,
+                                h2o_evloop_accepted_socket_t *accepted)
+{
+    if (!conf.tcp_accept_handoff || conf.thread_map.size <= 1)
+        return 0;
+    if (accepted->peeraddr.sa.sa_family != AF_INET && accepted->peeraddr.sa.sa_family != AF_INET6)
+        return 0;
+
+    unsigned local_load = accept_load(thread_index);
+    if (local_load < ACCEPT_HANDOFF_MIN_LOAD)
+        return 0;
+
+    if (*batch_count == 0) {
+        *batch_count = conf.thread_map.size > 2 ? 2 : 1;
+        sample_handoff_peers(batches, *batch_count);
+    }
+    return enqueue_handoff(batches, *batch_count, local_load, listener_index, accepted);
+}
+
+static void on_handoff_notification(h2o_multithread_receiver_t *receiver, h2o_linklist_t *messages)
+{
+    h2o_linklist_insert_list(&conf.threads[thread_index].handoffs, messages);
+}
+
+/* drain once per event-loop turn; pending slots cover queued and in-flight handoffs */
+static int process_handoffs(void)
+{
+    h2o_linklist_t *handoffs = &conf.threads[thread_index].handoffs;
+    int shutting_down = shutdown_requested();
+    for (size_t i = 0; (shutting_down || i < ACCEPT_HANDOFF_ADOPT_BUDGET) && !h2o_linklist_is_empty(handoffs); ++i) {
+        struct accept_handoff_t *handoff = H2O_STRUCT_FROM_MEMBER(struct accept_handoff_t, message.link, handoffs->next);
+        h2o_linklist_unlink(&handoff->message.link);
+        if (shutting_down || shutdown_requested()) {
+            close(handoff->accepted.fd);
+            num_connections(-1);
+        } else {
+            accept_connection(conf.threads[thread_index].listeners + handoff->listener_index, &handoff->accepted);
+        }
+        __atomic_sub_fetch(&conf.threads[thread_index].pending_handoffs, 1, __ATOMIC_RELAXED);
+        free(handoff);
+    }
+    return !h2o_linklist_is_empty(handoffs);
 }
 
 static void close_idle_connections(h2o_context_t *ctx)
@@ -4525,6 +4683,8 @@ static void close_idle_connections(h2o_context_t *ctx)
 static void on_accept(h2o_socket_t *listener, const char *err)
 {
     struct listener_ctx_t *ctx = listener->data;
+    struct accept_handoff_batch_t batches[2];
+    size_t batch_count = 0;
 
     /* TLS Handshakes take about 1ms, this effectively limits the latency induced by TLS handshakes to 10ms per event loop. */
     size_t num_accepts = 10;
@@ -4533,8 +4693,8 @@ static void on_accept(h2o_socket_t *listener, const char *err)
         return;
     }
 
-    do {
-        h2o_socket_t *sock;
+    while (num_accepts-- != 0 && !shutdown_requested()) {
+        h2o_evloop_accepted_socket_t accepted = {0};
         close_idle_connections(ctx->accept_ctx.ctx);
 
         if (num_connections(1) >= conf.max_connections) {
@@ -4545,27 +4705,18 @@ static void on_accept(h2o_socket_t *listener, const char *err)
             num_connections(-1);
             break;
         }
-        if ((sock = h2o_evloop_socket_accept(listener)) == NULL) {
+        if (h2o_evloop_socket_accept_fd(listener, &accepted) != 0) {
             num_connections(-1);
             break;
         }
         num_sessions(1);
 
-        sock->on_close.cb = on_socketclose;
-        sock->on_close.data = ctx->accept_ctx.ctx;
+        if (!try_handoff_accepted(batches, &batch_count, ctx->listener_index, &accepted))
+            accept_connection(ctx, &accepted);
+    }
 
-        struct listener_config_t *listener_config = conf.listeners[ctx->listener_index];
-        if (listener_config->sndbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_SNDBUF, &listener_config->sndbuf,
-                                                       sizeof(listener_config->sndbuf)) != 0)
-            h2o_perror("failed to set SO_SNDBUF");
-        if (listener_config->rcvbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_RCVBUF, &listener_config->rcvbuf,
-                                                       sizeof(listener_config->rcvbuf)) != 0)
-            h2o_perror("failed to set SO_RCVBUF");
-        set_tcp_congestion_controller(sock, listener_config->tcp_congestion_controller);
-
-        h2o_accept(&ctx->accept_ctx, sock);
-
-    } while (--num_accepts != 0);
+    for (size_t i = 0; i < batch_count; ++i)
+        h2o_multithread_send_messages(&conf.threads[batches[i].worker].handoff_receiver, &batches[i].messages);
 }
 
 static int validate_token(h2o_http3_server_ctx_t *ctx, struct sockaddr *remote, ptls_iovec_t client_cid, ptls_iovec_t server_cid,
@@ -4704,6 +4855,9 @@ static void update_listener_state(struct listener_ctx_t *listeners)
 {
     size_t i;
 
+    if (conf.test_single_acceptor && thread_index != 0)
+        return;
+
     if (num_connections(0) < conf.max_connections) {
         for (i = 0; i != conf.num_listeners; ++i) {
             if (conf.listeners[i]->quic.ctx == NULL && !h2o_socket_is_reading(listeners[i].sock))
@@ -4735,12 +4889,21 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     size_t i;
 
     h2o_context_init(&conf.threads[thread_index].ctx, h2o_evloop_create(), &conf.globalconf);
+    conf.threads[thread_index].ctx.thread_index = thread_index;
     conf.threads[thread_index].ctx.http3.next_cid.node_id = conf.quic.node_id;
     conf.threads[thread_index].ctx.http3.next_cid.thread_id = (uint32_t)thread_index;
     h2o_multithread_register_receiver(conf.threads[thread_index].ctx.queue, &conf.threads[thread_index].server_notifications,
                                       on_server_notification);
     h2o_multithread_register_receiver(conf.threads[thread_index].ctx.queue, &conf.threads[thread_index].memcached,
                                       h2o_memcached_receiver);
+    if (conf.tcp_accept_handoff) {
+        conf.threads[thread_index].listeners = listeners;
+        conf.threads[thread_index].open_sockets = 0;
+        conf.threads[thread_index].pending_handoffs = 0;
+        h2o_linklist_init_anchor(&conf.threads[thread_index].handoffs);
+        h2o_multithread_register_receiver(conf.threads[thread_index].ctx.queue, &conf.threads[thread_index].handoff_receiver,
+                                          on_handoff_notification);
+    }
     if (neverbleed != NULL) {
         int fd = neverbleed_get_fd(neverbleed);
         async_nb.sock = h2o_evloop_socket_create(conf.threads[thread_index].ctx.loop, fd, H2O_SOCKET_FLAG_DONT_READ);
@@ -4830,7 +4993,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     /* now that all worker threads are ready, in main thread, set signal handler for graceful shutdown / or exit immediately */
     if (thread_index == 0) {
         h2o_set_signal_handler(SIGTERM, on_sigterm_set_flag_notify_threads);
-        if (conf.shutdown_requested)
+        if (shutdown_requested())
             exit(0);
         fprintf(stderr, "h2o server (pid:%d) is ready to serve requests with %zu threads\n", (int)getpid(), conf.thread_map.size);
     }
@@ -4839,9 +5002,11 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     h2o_barrier_wait(&conf.startup_sync_barrier_post);
 
     /* the main loop */
-    while (!conf.shutdown_requested) {
+    while (!shutdown_requested()) {
         h2o_context_t *ctx = &conf.threads[thread_index].ctx;
         uint32_t max_wait = h2o_cleanup_thread(h2o_now(ctx->loop), ctx);
+        if (conf.tcp_accept_handoff && process_handoffs())
+            max_wait = 0;
         update_listener_state(listeners);
         h2o_evloop_run(ctx->loop, max_wait);
     }
@@ -4868,8 +5033,11 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     /* Wait until all the connections get closed. At least one worker thread that closed the last connection, turning
      * `num_connections(0)` to zero, will exit from this loop. Other worker threads might get stuck, as `h2o_evloop_run` does not
      * return when a different worker thread closes a connection. */
-    while (num_connections(0) != 0)
-        h2o_evloop_run(conf.threads[thread_index].ctx.loop, INT32_MAX);
+    while (num_connections(0) != 0) {
+        int max_wait = conf.tcp_accept_handoff && process_handoffs() ? 0 : INT32_MAX;
+        if (num_connections(0) != 0)
+            h2o_evloop_run(conf.threads[thread_index].ctx.loop, max_wait);
+    }
 
     /* More than one thread might reach here; take a lock so that the first thread does the cleanup. */
     static pthread_mutex_t cleanup_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -5176,6 +5344,7 @@ static void setup_configurators(void)
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_crash_handler_wait_pipe_close);
         h2o_configurator_define_command(c, "tcp-reuseport", H2O_CONFIGURATOR_FLAG_GLOBAL, on_tcp_reuseport);
+        h2o_configurator_define_command(c, "tcp-accept-handoff", H2O_CONFIGURATOR_FLAG_GLOBAL, on_config_tcp_accept_handoff);
         h2o_configurator_define_command(c, "ssl-offload", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_ssl_offload);
         h2o_configurator_define_command(c, "neverbleed-offload", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
@@ -5722,6 +5891,8 @@ int main(int argc, char **argv)
     }
 
     /* start the threads */
+    /* loopback test verifies handoffs by letting only worker zero accept */
+    conf.test_single_acceptor = conf.tcp_accept_handoff && getenv("H2O_TEST_ACCEPT_HANDOFF_SINGLE_ACCEPTOR") != NULL;
     conf.threads = h2o_mem_alloc(sizeof(conf.threads[0]) * conf.thread_map.size);
     for (size_t i = 1; i != conf.thread_map.size; ++i) {
         pthread_t tid;

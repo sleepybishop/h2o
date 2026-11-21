@@ -706,41 +706,46 @@ h2o_socket_t *h2o_evloop_socket_create(h2o_evloop_t *loop, int fd, int flags)
     return &create_socket(loop, fd, flags)->super;
 }
 
-h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *_listener)
+int h2o_evloop_socket_accept_fd(h2o_socket_t *_listener, h2o_evloop_accepted_socket_t *accepted)
 {
     struct st_h2o_evloop_socket_t *listener = (struct st_h2o_evloop_socket_t *)_listener;
-    int fd;
-    h2o_socket_t *sock;
-    union {
-        struct sockaddr sa;
-        struct sockaddr_in sin4;
-        struct sockaddr_in6 sin6;
-    } peeraddr;
-    socklen_t peeraddrlen = sizeof(peeraddr);
-
+    accepted->peeraddrlen = sizeof(accepted->peeraddr);
 #if H2O_USE_ACCEPT4
-    if ((fd = accept4(listener->fd, &peeraddr.sa, &peeraddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC)) == -1)
-        return NULL;
-    sock = &create_socket(listener->loop, fd, H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION)->super;
+    accepted->fd = accept4(listener->fd, &accepted->peeraddr.sa, &accepted->peeraddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
-    if ((fd = cloexec_accept(listener->fd, &peeraddr.sa, &peeraddrlen)) == -1)
-        return NULL;
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    sock = &create_socket(listener->loop, fd, H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION)->super;
+    accepted->fd = cloexec_accept(listener->fd, &accepted->peeraddr.sa, &accepted->peeraddrlen);
+    if (accepted->fd != -1)
+        fcntl(accepted->fd, F_SETFL, O_NONBLOCK);
 #endif
-    if (peeraddrlen <= sizeof(peeraddr)) {
-        h2o_socket_setpeername(sock, &peeraddr.sa, peeraddrlen);
+    return accepted->fd == -1 ? -1 : 0;
+}
+
+h2o_socket_t *h2o_evloop_socket_create_accepted(h2o_evloop_t *loop, h2o_evloop_accepted_socket_t *accepted)
+{
+    int fd = accepted->fd;
+    assert(fd != -1);
+    h2o_socket_t *sock = &create_socket(loop, fd, H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION)->super;
+    accepted->fd = -1;
+    if (accepted->peeraddrlen <= sizeof(accepted->peeraddr)) {
+        h2o_socket_setpeername(sock, &accepted->peeraddr.sa, accepted->peeraddrlen);
     } else {
-        peeraddr.sa.sa_family = AF_UNSPEC;
+        accepted->peeraddr.sa.sa_family = AF_UNSPEC;
     }
 
     /* note: even on linux, the accepted socket might not inherit TCP_NODELAY from the listening socket; see
      * https://github.com/h2o/h2o/pull/2542#issuecomment-760700859 */
-    set_nodelay_if_likely_tcp(fd, &peeraddr.sa);
-
-    ptls_log_init_conn_state(&sock->_log_state, ptls_openssl_random_bytes, 0, &peeraddr.sa);
+    set_nodelay_if_likely_tcp(fd, &accepted->peeraddr.sa);
+    ptls_log_init_conn_state(&sock->_log_state, ptls_openssl_random_bytes, 0, &accepted->peeraddr.sa);
 
     return sock;
+}
+
+h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *listener)
+{
+    h2o_evloop_accepted_socket_t accepted;
+    if (h2o_evloop_socket_accept_fd(listener, &accepted) != 0)
+        return NULL;
+    return h2o_evloop_socket_create_accepted(h2o_socket_get_loop(listener), &accepted);
 }
 
 h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, socklen_t addrlen, h2o_socket_cb cb, const char **err)

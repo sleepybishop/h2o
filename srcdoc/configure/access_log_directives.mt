@@ -139,6 +139,7 @@ As an example, it is possible to log timestamps in millisecond resolution using 
 <caption>Connection (since v2.0)</caption>
 <tr><th>Name<th>Description
 <tr><td><code>connection-id</code><td>64-bit internal ID assigned to every client connection
+<tr><td><code>thread-index</code><td>zero-based index of the worker serving the connection
 <tr><td><code>ssl.protocol-version</code><td>SSL protocol version obtained from <a href="https://www.openssl.org/docs/manmaster/ssl/SSL_get_version.html"><code>SSL_get_version</code></a>
 <tr><td><code>ssl.session-reused</code><td><code>1</code> if the <a href="configure/base_directives.html#ssl-session-resumption">SSL session was reused</a>, or <code>0</code> if not<?= $ctx->{note}->(q{A single SSL connection may transfer more than one HTTP request.}) ?>
 <tr><td><code>ssl.session-id</code><td>base64-encoded value of the session id used for resuming the session (since v2.2)

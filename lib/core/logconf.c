@@ -86,6 +86,7 @@ enum {
     ELEMENT_TYPE_PROXY_SSL_CIPHER,              /* ${proxy.ssl.cipher}x */
     ELEMENT_TYPE_PROXY_SSL_CIPHER_BITS,         /* ${proxy.ssl.cipher_bits}x */
     ELEMENT_TYPE_SSL_SERVER_NAME,               /* ${ssl.server-name}x */
+    ELEMENT_TYPE_THREAD_INDEX,                  /* ${thread-index}x */
     NUM_ELEMENT_TYPES
 };
 
@@ -327,6 +328,7 @@ h2o_logconf_t *h2o_logconf_compile(const char *fmt, int escape, char *errbuf)
                     MAP_EXT_TO_PROTO("http3.qpack-blocked", http3.qpack_blocked);
                     MAP_EXT_TO_PROTO("http3.request-stream-bytes", http3.request_stream_bytes);
                     MAP_EXT_TO_PROTO("http3.response-stream-bytes", http3.response_stream_bytes);
+                    MAP_EXT_TO_TYPE("thread-index", ELEMENT_TYPE_THREAD_INDEX);
                     { /* not found */
                         h2o_iovec_t name = strdup_lowercased(pt, quote_end - pt);
                         NEW_ELEMENT(ELEMENT_TYPE_EXTENDED_VAR);
@@ -935,6 +937,10 @@ char *h2o_log_request(h2o_logconf_t *logconf, h2o_req_t *req, size_t *len, char 
             APPEND_SAFE_STRING_WITH_LEN(pos, s.base, s.len);
         } break;
 
+        case ELEMENT_TYPE_THREAD_INDEX:
+            RESERVE(sizeof(H2O_UINT64_LONGEST_STR) - 1);
+            pos += sprintf(pos, "%zu", req->conn->ctx->thread_index);
+            break;
         case ELEMENT_TYPE_LOGNAME:      /* %l */
         case ELEMENT_TYPE_EXTENDED_VAR: /* %{...}x */
         EmitNull:

@@ -99,6 +99,10 @@ void h2o_multithread_unregister_receiver(h2o_multithread_queue_t *queue, h2o_mul
  */
 void h2o_multithread_send_message(h2o_multithread_receiver_t *receiver, h2o_multithread_message_t *message);
 /**
+ * enqueues all messages in order and leaves the list empty
+ */
+void h2o_multithread_send_messages(h2o_multithread_receiver_t *receiver, h2o_linklist_t *messages);
+/**
  * create a thread
  */
 void h2o_multithread_create_thread(pthread_t *tid, const pthread_attr_t *attr, void *(*func)(void *), void *arg);

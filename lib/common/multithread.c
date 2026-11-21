@@ -189,38 +189,52 @@ void h2o_multithread_unregister_receiver(h2o_multithread_queue_t *queue, h2o_mul
     pthread_mutex_unlock(&queue->mutex);
 }
 
-void h2o_multithread_send_message(h2o_multithread_receiver_t *receiver, h2o_multithread_message_t *message)
+static void wake_queue(h2o_multithread_queue_t *queue)
 {
-    int do_send = 0;
-
-    pthread_mutex_lock(&receiver->queue->mutex);
-    if (message != NULL) {
-        assert(!h2o_linklist_is_linked(&message->link));
-        if (h2o_linklist_is_empty(&receiver->_messages)) {
-            h2o_linklist_unlink(&receiver->_link);
-            h2o_linklist_insert(&receiver->queue->receivers.active, &receiver->_link);
-            do_send = 1;
-        }
-        h2o_linklist_insert(&receiver->_messages, &message->link);
-    } else {
-        if (h2o_linklist_is_empty(&receiver->_messages))
-            do_send = 1;
-    }
-    pthread_mutex_unlock(&receiver->queue->mutex);
-
-    if (do_send) {
 #if H2O_USE_LIBUV
-        uv_async_send(&receiver->queue->async);
+    uv_async_send(&queue->async);
 #else
 #ifdef __linux__
-        uint64_t tmp = 1;
-        while (write(receiver->queue->async.write, &tmp, sizeof(tmp)) == -1 && errno == EINTR)
+    uint64_t one = 1;
+    while (write(queue->async.write, &one, sizeof(one)) == -1 && errno == EINTR)
 #else
-        while (write(receiver->queue->async.write, "", 1) == -1 && errno == EINTR)
+    while (write(queue->async.write, "", 1) == -1 && errno == EINTR)
 #endif
-            ;
+        ;
 #endif
+}
+
+void h2o_multithread_send_messages(h2o_multithread_receiver_t *receiver, h2o_linklist_t *messages)
+{
+    if (h2o_linklist_is_empty(messages))
+        return;
+
+    pthread_mutex_lock(&receiver->queue->mutex);
+    int wake = h2o_linklist_is_empty(&receiver->_messages);
+    if (wake) {
+        h2o_linklist_unlink(&receiver->_link);
+        h2o_linklist_insert(&receiver->queue->receivers.active, &receiver->_link);
     }
+    h2o_linklist_insert_list(&receiver->_messages, messages);
+    pthread_mutex_unlock(&receiver->queue->mutex);
+
+    if (wake)
+        wake_queue(receiver->queue);
+}
+
+void h2o_multithread_send_message(h2o_multithread_receiver_t *receiver, h2o_multithread_message_t *message)
+{
+    if (message == NULL) {
+        /* explicit wakeups, including SIGTERM, do not need to take the queue lock */
+        wake_queue(receiver->queue);
+        return;
+    }
+
+    assert(!h2o_linklist_is_linked(&message->link));
+    h2o_linklist_t messages;
+    h2o_linklist_init_anchor(&messages);
+    h2o_linklist_insert(&messages, &message->link);
+    h2o_multithread_send_messages(receiver, &messages);
 }
 
 void h2o_multithread_create_thread(pthread_t *tid, const pthread_attr_t *attr, void *(*func)(void *), void *arg)
