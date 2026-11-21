@@ -947,8 +947,9 @@ char *h2o_log_request(h2o_logconf_t *logconf, h2o_req_t *req, size_t *len, char 
             APPEND_SAFE_STRING_WITH_LEN(pos, s.base, s.len);
         } break;
         case ELEMENT_TYPE_THREAD_INDEX:
-            RESERVE(sizeof(H2O_UINT64_LONGEST_STR) - 1);
-            pos += sprintf(pos, "%zu", req->conn->ctx->thread_index);
+            /* standalone server sets CID thread ID on every worker, including TCP-only */
+            RESERVE(sizeof(H2O_UINT32_LONGEST_STR) - 1);
+            pos += sprintf(pos, "%" PRIu32, (uint32_t)req->conn->ctx->http3.next_cid.thread_id);
             break;
         case ELEMENT_TYPE_BUSYPOLL_IFACE: {
             const char *iface = NULL;
