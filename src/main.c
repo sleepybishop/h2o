@@ -309,7 +309,7 @@ static struct {
         h2o_multithread_receiver_t server_notifications;
         h2o_multithread_receiver_t memcached;
     } *threads;
-    volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t shutdown_signo;
     h2o_barrier_t startup_sync_barrier_init;
     h2o_barrier_t startup_sync_barrier_post;
     struct {
@@ -372,7 +372,7 @@ static struct {
     .tfo_queues = 0,   /* initialized in main() */
     .launch_time = 0,  /* initialized in main() */
     .threads = NULL,
-    .shutdown_requested = 0,
+    .shutdown_signo = 0,
     .state = {{0}},
     .crash_handler = "share/h2o/annotate-backtrace-symbols",
     .crash_handler_wait_pipe_close = 0,
@@ -4435,23 +4435,25 @@ static void dispose_resolve_tag_arg(resolve_tag_arg_t *arg)
     free(arg->node_cache.entries);
 }
 
-static void on_sigterm(int notify_threads)
+static void request_shutdown(int signo, int notify_threads)
 {
-    conf.shutdown_requested = 1;
-    if (notify_threads)
-        notify_all_threads();
+    int saved_errno = errno;
+    conf.shutdown_signo = signo;
     h2o_set_signal_handler(SIGTERM, SIG_IGN);
     h2o_set_signal_handler(SIGINT, SIG_IGN);
+    if (notify_threads)
+        notify_all_threads();
+    errno = saved_errno;
 }
 
-static void on_sigterm_set_flag_only(int signo)
+static void on_shutdown_signal(int signo)
 {
-    on_sigterm(0);
+    request_shutdown(signo, 0);
 }
 
-static void on_sigterm_set_flag_notify_threads(int signo)
+static void on_shutdown_signal_notify_threads(int signo)
 {
-    on_sigterm(1);
+    request_shutdown(signo, 1);
 }
 
 #ifdef LIBC_HAS_BACKTRACE
@@ -4512,8 +4514,8 @@ static void on_sigfatal(int signo)
 
 static void setup_signal_handlers(void)
 {
-    h2o_set_signal_handler(SIGINT, on_sigterm_set_flag_only);
-    h2o_set_signal_handler(SIGTERM, on_sigterm_set_flag_only);
+    h2o_set_signal_handler(SIGINT, on_shutdown_signal);
+    h2o_set_signal_handler(SIGTERM, on_shutdown_signal);
     h2o_set_signal_handler(SIGPIPE, SIG_IGN);
 #ifdef LIBC_HAS_BACKTRACE
     if ((crash_handler_fd = popen_crash_handler()) == -1)
@@ -5136,8 +5138,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
 
     /* now that all worker threads are ready, in main thread, set signal handler for graceful shutdown / or exit immediately */
     if (thread_index == 0) {
-        h2o_set_signal_handler(SIGTERM, on_sigterm_set_flag_notify_threads);
-        if (conf.shutdown_requested)
+        h2o_set_signal_handler(SIGINT, on_shutdown_signal_notify_threads);
+        h2o_set_signal_handler(SIGTERM, on_shutdown_signal_notify_threads);
+        if (conf.shutdown_signo != 0)
             exit(0);
 #if H2O_USE_EPOLL_BUSYPOLL
         /* apply interface settings with final worker credentials after epoll setup */
@@ -5151,7 +5154,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     h2o_barrier_wait(&conf.startup_sync_barrier_post);
 
     /* the main loop */
-    while (!conf.shutdown_requested) {
+    while (conf.shutdown_signo == 0) {
         h2o_context_t *ctx = &conf.threads[thread_index].ctx;
         uint32_t max_wait = h2o_cleanup_thread(h2o_now(ctx->loop), ctx);
         update_listener_state(listeners);
@@ -5159,7 +5162,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     }
 
     if (thread_index == 0)
-        fprintf(stderr, "received SIGTERM, gracefully shutting down\n");
+        fprintf(stderr, "received %s, gracefully shutting down\n", conf.shutdown_signo == SIGINT ? "SIGINT" : "SIGTERM");
 
     /* shutdown requested, unregister, close the listeners and notify the protocol handlers */
     for (i = 0; i != conf.num_listeners; ++i) {

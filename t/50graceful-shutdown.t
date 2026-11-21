@@ -1,9 +1,47 @@
 use strict;
 use warnings;
+use IO::Socket::INET;
 use Net::EmptyPort qw(check_port);
 use Test::More;
 use Time::HiRes;
 use t::Util;
+
+subtest 'SIGINT wakes idle workers' => sub {
+    my $port = empty_port();
+    my $server = spawn_h2o_raw(<< "EOT", [$port]);
+num-threads: 4
+listen: {host: 127.0.0.1, port: $port}
+hosts:
+  default:
+    paths:
+      /:
+        file.dir: @{[ DOC_ROOT ]}
+EOT
+    local $SIG{ALRM} = sub { die "timed out waiting for the in-flight request\n" };
+    alarm 10;
+    # Hold a request mid-body so the first worker to handle SIGINT cannot exit the process.
+    my $sock = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port") or die "connect: $!";
+    print {$sock} "GET /index.txt HTTP/1.1\r\nHost: default\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n";
+    like scalar(<$sock>), qr{^HTTP/1\.1 100 }, 'worker is waiting for the request body';
+    while (defined(my $header = <$sock>)) {
+        last if $header eq "\r\n";
+    }
+    kill 'INT', $server->{pid} or die "kill: $!";
+
+    # Rebinding detects the last worker closing its listener without waking it with another connection.
+    my $deadline = Time::HiRes::time() + 3;
+    my $replacement;
+    until ($replacement = IO::Socket::INET->new(LocalAddr => "127.0.0.1:$port", Listen => 1, ReuseAddr => 1)) {
+        last if Time::HiRes::time() >= $deadline;
+        Time::HiRes::sleep(0.02);
+    }
+    ok $replacement, 'all worker listeners are closed while the connection drains';
+    print {$sock} "x";
+    my $response = do { local $/; <$sock> };
+    like $response, qr{^HTTP/1\.1 200 .*\r\n\r\nhello\n\z}s, 'in-flight request finishes normally';
+    alarm 0;
+    close $sock;
+};
 
 # 1. send headers
 # 2. 1st goaway

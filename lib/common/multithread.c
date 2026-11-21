@@ -191,36 +191,32 @@ void h2o_multithread_unregister_receiver(h2o_multithread_queue_t *queue, h2o_mul
 
 void h2o_multithread_send_message(h2o_multithread_receiver_t *receiver, h2o_multithread_message_t *message)
 {
-    int do_send = 0;
-
-    pthread_mutex_lock(&receiver->queue->mutex);
+    /* NULL message only wakes the loop and is safe from a shutdown signal handler */
     if (message != NULL) {
+        pthread_mutex_lock(&receiver->queue->mutex);
         assert(!h2o_linklist_is_linked(&message->link));
-        if (h2o_linklist_is_empty(&receiver->_messages)) {
+        int wake = h2o_linklist_is_empty(&receiver->_messages);
+        if (wake) {
             h2o_linklist_unlink(&receiver->_link);
             h2o_linklist_insert(&receiver->queue->receivers.active, &receiver->_link);
-            do_send = 1;
         }
         h2o_linklist_insert(&receiver->_messages, &message->link);
-    } else {
-        if (h2o_linklist_is_empty(&receiver->_messages))
-            do_send = 1;
+        pthread_mutex_unlock(&receiver->queue->mutex);
+        if (!wake)
+            return;
     }
-    pthread_mutex_unlock(&receiver->queue->mutex);
 
-    if (do_send) {
 #if H2O_USE_LIBUV
-        uv_async_send(&receiver->queue->async);
+    uv_async_send(&receiver->queue->async);
 #else
 #ifdef __linux__
-        uint64_t tmp = 1;
-        while (write(receiver->queue->async.write, &tmp, sizeof(tmp)) == -1 && errno == EINTR)
+    uint64_t tmp = 1;
+    while (write(receiver->queue->async.write, &tmp, sizeof(tmp)) == -1 && errno == EINTR)
 #else
-        while (write(receiver->queue->async.write, "", 1) == -1 && errno == EINTR)
+    while (write(receiver->queue->async.write, "", 1) == -1 && errno == EINTR)
 #endif
-            ;
+        ;
 #endif
-    }
 }
 
 void h2o_multithread_create_thread(pthread_t *tid, const pthread_attr_t *attr, void *(*func)(void *), void *arg)
