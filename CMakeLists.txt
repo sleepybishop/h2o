@@ -153,6 +153,37 @@ ELSE ()
 ENDIF ()
 OPTION(WITH_KTLS "use Kernel TLS" ${WITH_KTLS_DEFAULT})
 
+# generated netdev bindings must support per-NAPI IRQ suspension (linux 6.13)
+IF (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    FIND_PATH(SYSTEM_YNL_INCLUDE_DIR ynl/netdev-user.h)
+    FIND_LIBRARY(SYSTEM_YNL_LIB ynl)
+    IF (SYSTEM_YNL_INCLUDE_DIR AND SYSTEM_YNL_LIB)
+        CMAKE_PUSH_CHECK_STATE()
+        SET(CMAKE_REQUIRED_INCLUDES ${SYSTEM_YNL_INCLUDE_DIR})
+        SET(CMAKE_REQUIRED_LIBRARIES ${SYSTEM_YNL_LIB})
+        CHECK_C_SOURCE_COMPILES("
+#define _GNU_SOURCE
+#include <string.h>
+#include <sys/epoll.h>
+#include <ynl/ynl.h>
+#include <ynl/netdev-user.h>
+int main(void) {
+    struct ynl_sock *ys = ynl_sock_create(&ynl_netdev_family, NULL);
+    struct netdev_napi_set_req req = {0};
+    netdev_napi_set_req_set_irq_suspend_timeout(&req, 1);
+    netdev_napi_set(ys, &req);
+    netdev_napi_get_rsp_free(netdev_napi_get(ys, NULL));
+    netdev_queue_get_list_free(netdev_queue_get_dump(ys, NULL));
+    return epoll_pwait2(-1, NULL, 0, NULL, NULL);
+}" SYSTEM_HAS_EPOLL_BUSYPOLL)
+        CMAKE_POP_CHECK_STATE()
+    ENDIF ()
+ENDIF ()
+OPTION(WITH_EPOLL_BUSYPOLL "build the standalone server with Linux epoll busy-poll support" ${SYSTEM_HAS_EPOLL_BUSYPOLL})
+IF (WITH_EPOLL_BUSYPOLL AND NOT SYSTEM_HAS_EPOLL_BUSYPOLL)
+    MESSAGE(FATAL_ERROR "WITH_EPOLL_BUSYPOLL requires Linux, epoll_pwait2 and libynl with generated netdev queue and NAPI bindings")
+ENDIF ()
+
 # aegis
 FIND_PACKAGE(aegis)
 IF (aegis_FOUND)
@@ -800,6 +831,10 @@ IF (WITH_IO_URING)
     SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DH2O_USE_IO_URING=1")
     LIST(APPEND STANDALONE_SOURCE_FILES lib/common/io_uring.c)
 ENDIF ()
+IF (WITH_EPOLL_BUSYPOLL)
+    SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DH2O_USE_EPOLL_BUSYPOLL=1")
+    LIST(APPEND STANDALONE_SOURCE_FILES lib/common/busypoll.c)
+ENDIF ()
 ADD_EXECUTABLE(h2o ${STANDALONE_SOURCE_FILES})
 SET_TARGET_PROPERTIES(h2o PROPERTIES COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS}")
 TARGET_INCLUDE_DIRECTORIES(h2o PUBLIC ${OPENSSL_INCLUDE_DIR})
@@ -821,6 +856,10 @@ IF (WITH_IO_URING)
     TARGET_INCLUDE_DIRECTORIES(h2o PUBLIC ${LIBURING_INCLUDE_DIRS})
     TARGET_LINK_DIRECTORIES(h2o PUBLIC ${LIBURING_LIBRARY_DIRS})
     TARGET_LINK_LIBRARIES(h2o ${LIBURING_LIBRARIES})
+ENDIF ()
+IF (WITH_EPOLL_BUSYPOLL)
+    TARGET_INCLUDE_DIRECTORIES(h2o PRIVATE ${SYSTEM_YNL_INCLUDE_DIR})
+    TARGET_LINK_LIBRARIES(h2o ${SYSTEM_YNL_LIB})
 ENDIF ()
 TARGET_LINK_LIBRARIES(h2o ${EXTRA_LIBS})
 

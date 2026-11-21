@@ -891,6 +891,76 @@ Output of the lego command (including errors) are emitted to the error log of h2
 .RE
 .RE
 
+.SS busy-poll-map
+Assigns Linux TCP listeners to interfaces and pins their workers to CPUs.
+
+.PP
+
+
+Build the standalone server with WITH_EPOLL_BUSYPOLL, libynl with generated Linux netdev queue and NAPI bindings, and a libc that provides epoll_pwait2.
+Check for epoll_busypoll: YES in h2o --version.
+Run a standalone worker process with tcp-reuseport: ON. This process must own the listener group and the mapped queues.
+Each entry in interfaces names a device by its ifindex and lists Linux CPU IDs in RX queue order, starting with queue 0.
+Use ip link show to find the interface index.
+For active polling, supply one available CPU for each RX queue and use a driver that reports a distinct NAPI ID for each RX queue.
+
+
+H2O assigns workers in the order of the interfaces and queues in the map. An explicit CPU list in num-threads must start with these same CPU IDs.
+Any remaining workers use ordinary epoll and can accept traffic from other interfaces, including loopback.
+Active polling supports TCP listeners. If an accepted connection has an unknown or different NAPI ID, H2O logs a warning and switches that worker to ordinary epoll.
+A worker also switches to ordinary epoll when it opens an outbound IP socket, such as a connection to a reverse-proxy upstream, or imports an IP socket into its event loop.
+The worker continues serving connections in this mode.
+
+
+Set options.mode to BUSYPOLL for epoll busy polling, SUSPEND for IRQ suspension, or OFF to route the interface to workers using ordinary epoll.
+Active modes accept per-NAPI gro-flush-timeout in nanoseconds and defer-hard-irqs in consecutive empty polls.
+For IRQ suspension, configure a positive suspend-timeout in nanoseconds or set it on the device before startup.
+Changing NAPI settings requires CAP_NET_ADMIN. H2O restores the previous values of explicitly configured settings at graceful shutdown. Omitted settings retain the device's values.
+During h2o -t H2O reads the device's queues and NAPI IDs. Worker startup applies the requested NAPI settings.
+See the Linux NAPI documentation for kernel configuration.
+
+.PP
+.BR Example:
+Two RX queues on interface 2, with a third worker for other interfaces
+.PP
+.nf
+.RS
+tcp-reuseport: ON
+num-threads: [2, 3, 1]
+busy-poll-usecs: 50
+busy-poll-map:
+  interfaces:
+    - ifindex: 2
+      cpus: [2, 3]
+      options:
+        mode: BUSYPOLL
+
+.RE
+.fi
+.PP
+
+
+.RE
+.RE
+
+.SS busy-poll-budget
+Sets the maximum number of packets per NAPI poll on an active busy-poll worker. Zero uses the kernel default.
+
+.PP
+
+.RE
+.RE
+
+
+.SS busy-poll-usecs
+Sets the busy-poll duration in microseconds for each active worker's epoll instance. Zero uses the system busy-poll setting.
+
+.PP
+
+.RE
+.RE
+
+
 .SS capabilities
 Set capabilities to be added to the process before dropping root privileges.
 
@@ -904,6 +974,24 @@ See man 7 capabilities for details.
 
 .RE
 .RE
+
+.SS epoll-nonblock
+Makes active polling workers call epoll repeatedly with a minimal timeout when idle. This can consume a full CPU per worker.
+
+.PP
+
+.RE
+.RE
+
+
+.SS epoll-prefer-bp
+Asks the kernel to prefer busy polling over device interrupts on active workers. SUSPEND mode enables this preference automatically.
+
+.PP
+
+.RE
+.RE
+
 
 .SS error-log
 Path of the file to which error logs should be appended.
@@ -2641,6 +2729,10 @@ http2.priority.received.weightweight of the most recent priority specified by th
 
 Miscellaneous
 NameDescription
+thread-indexzero-based index of the worker serving the request
+bp.ifaceinterface name assigned by busy-poll-map, or - for an unmapped worker
+bp.cpu-idxLinux CPU ID assigned by busy-poll-map, or -1 for an unmapped worker
+bp.napi-idNAPI ID assigned to the serving worker, or 0 when the worker uses ordinary epoll
 errorrequest-level errors. Unless specified otherwise by using the error-log.emit-request-errors directive, the same messages are emitted to the error-log. (since v2.1)
 
 

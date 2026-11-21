@@ -101,6 +101,12 @@
 #include "standalone.h"
 #include "../lib/probes_.h"
 
+#if H2O_USE_EPOLL_BUSYPOLL
+#include "h2o/busypoll.h"
+#include <net/if.h>
+#include <sched.h>
+#endif
+
 #if defined(__linux__)
 #include <sys/eventfd.h>
 #define ASYNC_NB_USE_EVENTFD 1
@@ -342,6 +348,12 @@ static struct {
     yoml_t *yoml;
 #ifdef LIBCAP_FOUND
     H2O_VECTOR(cap_value_t) capabilities;
+#endif
+#if H2O_USE_EPOLL_BUSYPOLL
+    struct {
+        h2o_busypoll_nic_vector_t nic_to_cpu_map;
+        struct busypoll_epoll_params epoll_params;
+    } busypoll;
 #endif
 } conf = {
     .globalconf = {0},
@@ -2770,21 +2782,46 @@ ErrorExit:
     return -1;
 }
 
-static void socket_reuseport(int fd)
+static int socket_reuseport(int fd)
 {
 #if H2O_USE_REUSEPORT
     int opt = 1;
-    if (setsockopt(fd, SOL_SOCKET, H2O_SO_REUSEPORT, &opt, sizeof(opt)) != 0)
+    if (setsockopt(fd, SOL_SOCKET, H2O_SO_REUSEPORT, &opt, sizeof(opt)) != 0) {
         fprintf(stderr, "[warning] setsockopt(SO_REUSEPORT) failed:%s\n", strerror(errno));
+        return -1;
+    }
 #endif
+    return 0;
 }
+
+#if H2O_USE_EPOLL_BUSYPOLL
+static const struct busypoll_nic_t *get_worker_nic(size_t worker_index, size_t *queue)
+{
+    const h2o_busypoll_nic_vector_t *nics = &conf.busypoll.nic_to_cpu_map;
+    for (size_t i = 0; i != nics->size; ++i) {
+        const struct busypoll_nic_t *nic = nics->entries + i;
+        if (worker_index < nic->cpus.size) {
+            *queue = worker_index;
+            return nic;
+        }
+        worker_index -= nic->cpus.size;
+    }
+    return NULL;
+}
+#endif
 
 /**
  * Opens an INET or INET6 socket for accepting connections. When the protocol is UDP, SO_REUSEPORT is set if available.
  */
-static int open_listener(int domain, int type, int protocol, struct sockaddr *addr, socklen_t addrlen)
+static int open_listener(int domain, int type, int protocol, struct sockaddr *addr, socklen_t addrlen, size_t worker_index)
 {
     int fd;
+
+#if H2O_USE_EPOLL_BUSYPOLL
+    const int steer_tcp = type == SOCK_STREAM && conf.busypoll.nic_to_cpu_map.size != 0;
+#else
+    const int steer_tcp = 0;
+#endif
 
     if ((fd = socket(domain, type, protocol)) == -1)
         goto Error;
@@ -2802,8 +2839,8 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
 #endif
     switch (type) {
     case SOCK_STREAM: {
-        if (conf.tcp_reuseport)
-            socket_reuseport(fd);
+        if (conf.tcp_reuseport && socket_reuseport(fd) != 0 && steer_tcp)
+            goto Error;
         /* TCP: set SO_REUSEADDR flag to avoid TIME_WAIT after shutdown */
         int on = 1;
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0)
@@ -2818,6 +2855,23 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
         h2o_fatal("unexpected socket type %d", type);
         break;
     }
+
+#if H2O_USE_EPOLL_BUSYPOLL
+    if (steer_tcp && conf.tcp_reuseport) {
+        size_t queue;
+        if (get_worker_nic(conf.thread_map.size - 1, &queue) == NULL) {
+            if (worker_index == 0 && h2o_busypoll_attach_partial_map(fd, &conf.busypoll.nic_to_cpu_map, conf.thread_map.size) != 0)
+                goto Error;
+        } else {
+            /* bound device is part of the reuseport group key; queue order is listen order */
+            const struct busypoll_nic_t *nic = get_worker_nic(worker_index, &queue);
+            if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, nic->iface.base, nic->iface.len + 1) != 0)
+                goto Error;
+            if (queue == 0 && nic->cpus.size > 1 && h2o_busypoll_attach_cbpf(fd, nic->cpus.size) != 0)
+                goto Error;
+        }
+    }
+#endif
 
     /* bind */
     if (bind(fd, addr, addrlen) != 0)
@@ -2893,7 +2947,7 @@ static int open_inet_listener(h2o_configurator_command_t *cmd, yoml_t *node, con
 {
     int fd;
 
-    if ((fd = open_listener(domain, type, protocol, addr, addrlen)) == -1)
+    if ((fd = open_listener(domain, type, protocol, addr, addrlen, 0)) == -1)
         h2o_configurator_errprintf(cmd, node, "failed to listen to %s port %s:%s: %s", protocol_to_string(protocol),
                                    hostname != NULL ? hostname : "ANY", servname, strerror(errno));
 
@@ -3236,6 +3290,17 @@ static int on_config_listen_element(h2o_configurator_command_t *cmd, h2o_configu
         h2o_configurator_errprintf(cmd, node, "value must be a string or a mapping (with keys: `port` and optionally `host`)");
         return -1;
     }
+
+#if H2O_USE_EPOLL_BUSYPOLL
+    if (strcmp(type, "quic") == 0 || strcmp(type, "mptcp") == 0) {
+        for (size_t i = 0; i != conf.busypoll.nic_to_cpu_map.size; ++i) {
+            if (conf.busypoll.nic_to_cpu_map.entries[i].mode != BP_MODE_OFF) {
+                h2o_configurator_errprintf(cmd, node, "listen type %s does not support single-NAPI busy polling", type);
+                return -1;
+            }
+        }
+    }
+#endif
 
     if (strcmp(type, "unix") == 0) {
 
@@ -3961,6 +4026,212 @@ static int on_config_onoff(h2o_configurator_command_t *cmd, yoml_t *node, int *s
     return 0;
 }
 
+#if H2O_USE_EPOLL_BUSYPOLL
+static int on_epoll_nonblock(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return on_config_onoff(cmd, node, &conf.busypoll.epoll_params.nonblock);
+}
+
+static int on_epoll_prefer_bp(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return on_config_onoff(cmd, node, &conf.busypoll.epoll_params.prefer);
+}
+
+static int parse_busypoll_number(h2o_configurator_command_t *cmd, yoml_t *node, uintmax_t max, uintmax_t *result)
+{
+    if (node->type == YOML_TYPE_SCALAR && node->data.scalar[0] >= '0' && node->data.scalar[0] <= '9') {
+        char *end;
+        errno = 0;
+        uintmax_t value = strtoumax(node->data.scalar, &end, 10);
+        if (errno == 0 && *end == '\0' && value <= max) {
+            *result = value;
+            return 0;
+        }
+    }
+    h2o_configurator_errprintf(cmd, node, "expected an integer between 0 and %" PRIuMAX, max);
+    return -1;
+}
+
+static int on_busy_poll_budget(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    uintmax_t budget;
+    if (parse_busypoll_number(cmd, node, UINT16_MAX, &budget) != 0)
+        return -1;
+    conf.busypoll.epoll_params.budget = (uint16_t)budget;
+    return 0;
+}
+
+static int on_busy_poll_usecs(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    uintmax_t usecs;
+    if (parse_busypoll_number(cmd, node, INT32_MAX, &usecs) != 0)
+        return -1;
+    conf.busypoll.epoll_params.usecs = (uint32_t)usecs;
+    return 0;
+}
+
+static int parse_busypoll_nic(h2o_configurator_command_t *cmd, yoml_t *node, struct busypoll_nic_t *nic, const cpu_set_t *available,
+                              cpu_set_t *used)
+{
+    yoml_t **index, **cpus, **options, **mode, **gro, **irqs, **suspend;
+    if (node->type != YOML_TYPE_MAPPING) {
+        h2o_configurator_errprintf(cmd, node, "each interface must be a mapping");
+        return -1;
+    }
+    if (h2o_configurator_parse_mapping(cmd, node, "ifindex:s,cpus:a,options:m", NULL, &index, &cpus, &options) != 0 ||
+        h2o_configurator_parse_mapping(cmd, *options, "mode:s", "gro-flush-timeout:s,defer-hard-irqs:s,suspend-timeout:s", &mode,
+                                       &gro, &irqs, &suspend) != 0)
+        return -1;
+    uintmax_t ifindex;
+    char iface[IF_NAMESIZE];
+    if (parse_busypoll_number(cmd, *index, INT_MAX, &ifindex) != 0)
+        return -1;
+    if (ifindex == 0 || if_indextoname((unsigned)ifindex, iface) == NULL) {
+        h2o_configurator_errprintf(cmd, *index, "unknown interface index %" PRIuMAX, ifindex);
+        return -1;
+    }
+    for (size_t i = 0; i < conf.busypoll.nic_to_cpu_map.size; ++i) {
+        if (conf.busypoll.nic_to_cpu_map.entries[i].ifindex == ifindex) {
+            h2o_configurator_errprintf(cmd, *index, "interface %s appears more than once", iface);
+            return -1;
+        }
+    }
+    nic->ifindex = (unsigned)ifindex;
+    nic->iface = h2o_strdup(NULL, iface, SIZE_MAX);
+    ssize_t m = h2o_configurator_get_one_of(cmd, *mode, "OFF,SUSPEND,BUSYPOLL");
+    if (m == -1)
+        return -1;
+    nic->mode = (enum en_h2o_bp_mode_t)m;
+    uintmax_t value;
+    if (gro != NULL) {
+        if (parse_busypoll_number(cmd, *gro, ULONG_MAX, &value) != 0)
+            return -1;
+        nic->options.gro_flush_timeout = value;
+        nic->options.has_gro_flush_timeout = 1;
+    }
+    if (irqs != NULL) {
+        if (parse_busypoll_number(cmd, *irqs, INT32_MAX, &value) != 0)
+            return -1;
+        nic->options.defer_hard_irqs = (uint32_t)value;
+        nic->options.has_defer_hard_irqs = 1;
+    }
+    if (suspend != NULL) {
+        if (parse_busypoll_number(cmd, *suspend, ULONG_MAX, &value) != 0)
+            return -1;
+        if (nic->mode == BP_MODE_SUSPEND && value == 0) {
+            h2o_configurator_errprintf(cmd, *suspend, "SUSPEND mode needs a positive suspend-timeout");
+            return -1;
+        }
+        nic->options.suspend_timeout = value;
+        nic->options.has_suspend_timeout = 1;
+    }
+    if (nic->options.suspend_timeout != 0 && nic->mode != BP_MODE_SUSPEND) {
+        h2o_configurator_errprintf(cmd, *suspend, "a nonzero suspend-timeout requires SUSPEND mode");
+        return -1;
+    }
+    if (nic->mode == BP_MODE_OFF && (nic->options.gro_flush_timeout != 0 || nic->options.defer_hard_irqs != 0)) {
+        h2o_configurator_errprintf(cmd, *options, "NAPI tuning requires an active busy-poll mode");
+        return -1;
+    }
+    size_t num_cpus = (*cpus)->data.sequence.size;
+    if (num_cpus == 0 || num_cpus > (size_t)CPU_COUNT(available)) {
+        h2o_configurator_errprintf(cmd, *cpus, "cpus must contain one available CPU per mapped queue");
+        return -1;
+    }
+    h2o_vector_reserve(NULL, &nic->cpus, num_cpus);
+    for (size_t j = 0; j < num_cpus; ++j) {
+        yoml_t *entry = (*cpus)->data.sequence.elements[j];
+        uintmax_t cpu;
+        if (parse_busypoll_number(cmd, entry, CPU_SETSIZE - 1, &cpu) != 0)
+            return -1;
+        if (!CPU_ISSET(cpu, available) || CPU_ISSET(cpu, used)) {
+            h2o_configurator_errprintf(cmd, entry, "CPU %" PRIuMAX " is unavailable or already assigned to another queue", cpu);
+            return -1;
+        }
+        CPU_SET(cpu, used);
+        nic->cpus.entries[nic->cpus.size++] = (unsigned)cpu;
+    }
+    h2o_vector_reserve(NULL, &nic->napi_ids, num_cpus);
+    memset(nic->napi_ids.entries, 0, sizeof(nic->napi_ids.entries[0]) * num_cpus);
+    nic->napi_ids.size = num_cpus;
+    return 0;
+}
+static int on_busy_poll_map(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    yoml_t **interfaces;
+    if (h2o_configurator_parse_mapping(cmd, node, "interfaces:a", NULL, &interfaces) != 0)
+        return -1;
+    if (conf.busypoll.nic_to_cpu_map.size != 0 || (*interfaces)->data.sequence.size == 0) {
+        h2o_configurator_errprintf(cmd, node, "specify one busy-poll-map with at least one interface");
+        return -1;
+    }
+    cpu_set_t available, used;
+    if (sched_getaffinity(0, sizeof(available), &available) != 0) {
+        h2o_configurator_errprintf(cmd, node, "cannot read available CPUs: %s", strerror(errno));
+        return -1;
+    }
+    CPU_ZERO(&used);
+    h2o_busypoll_nic_vector_t *map = &conf.busypoll.nic_to_cpu_map;
+    h2o_vector_reserve(NULL, map, (*interfaces)->data.sequence.size);
+    for (size_t i = 0; i < (*interfaces)->data.sequence.size; ++i) {
+        struct busypoll_nic_t *nic = map->entries + i;
+        *nic = (struct busypoll_nic_t){0};
+        if (parse_busypoll_nic(cmd, (*interfaces)->data.sequence.elements[i], nic, &available, &used) != 0)
+            return -1;
+        ++map->size;
+    }
+    return 0;
+}
+
+/* check cross-directive constraints after parsing, including in -t mode */
+static int validate_busypoll_config(void)
+{
+    if (conf.busypoll.nic_to_cpu_map.size == 0) {
+        if (conf.busypoll.epoll_params.nonblock || conf.busypoll.epoll_params.prefer || conf.busypoll.epoll_params.budget ||
+            conf.busypoll.epoll_params.usecs) {
+            fprintf(stderr, "busy-poll epoll settings require a busy-poll-map\n");
+            return -1;
+        }
+        return 0;
+    }
+    if (!conf.tcp_reuseport) {
+        fprintf(stderr, "busy-poll-map requires tcp-reuseport: ON\n");
+        return -1;
+    }
+    if (conf.run_mode == RUN_MODE_MASTER || conf.run_mode == RUN_MODE_DAEMON || conf.server_starter.fds != NULL) {
+        fprintf(stderr, "busy-poll-map requires standalone worker mode to create its per-interface listeners\n");
+        return -1;
+    }
+    size_t worker = 0;
+    for (size_t i = 0; i < conf.busypoll.nic_to_cpu_map.size; ++i) {
+        const struct busypoll_nic_t *nic = conf.busypoll.nic_to_cpu_map.entries + i;
+        for (size_t q = 0; q < nic->cpus.size; ++q, ++worker) {
+            if (worker == conf.thread_map.size) {
+                fprintf(stderr, "busy-poll-map assigns more queues than num-threads\n");
+                return -1;
+            }
+            int cpu = (int)nic->cpus.entries[q];
+            if (conf.thread_map.entries[worker] >= 0 && conf.thread_map.entries[worker] != cpu) {
+                fprintf(stderr, "busy-poll-map CPU %d conflicts with num-threads for worker %zu\n", cpu, worker);
+                return -1;
+            }
+            conf.thread_map.entries[worker] = cpu;
+        }
+    }
+    for (size_t i = 0; i != conf.busypoll.nic_to_cpu_map.size; ++i) {
+        if (h2o_busypoll_discover_queues(conf.busypoll.nic_to_cpu_map.entries + i) != 0)
+            return -1;
+    }
+    return 0;
+}
+#else
+static int on_busypoll_unsupported(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    h2o_configurator_errprintf(cmd, node, "support for epoll busypolling is not available");
+    return -1;
+}
+#endif
+
 static int on_config_crash_handler_wait_pipe_close(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     return on_config_onoff(cmd, node, &conf.crash_handler_wait_pipe_close);
@@ -4170,6 +4441,7 @@ static void on_sigterm(int notify_threads)
     if (notify_threads)
         notify_all_threads();
     h2o_set_signal_handler(SIGTERM, SIG_IGN);
+    h2o_set_signal_handler(SIGINT, SIG_IGN);
 }
 
 static void on_sigterm_set_flag_only(int signo)
@@ -4240,6 +4512,7 @@ static void on_sigfatal(int signo)
 
 static void setup_signal_handlers(void)
 {
+    h2o_set_signal_handler(SIGINT, on_sigterm_set_flag_only);
     h2o_set_signal_handler(SIGTERM, on_sigterm_set_flag_only);
     h2o_set_signal_handler(SIGPIPE, SIG_IGN);
 #ifdef LIBC_HAS_BACKTRACE
@@ -4555,6 +4828,13 @@ static void on_accept(h2o_socket_t *listener, const char *err)
         sock->on_close.data = ctx->accept_ctx.ctx;
 
         struct listener_config_t *listener_config = conf.listeners[ctx->listener_index];
+#if H2O_USE_EPOLL_BUSYPOLL
+        if (conf.busypoll.nic_to_cpu_map.size != 0 && listener_config->addr.ss_family != AF_UNIX &&
+            h2o_busypoll_check_socket(sock) != 0) {
+            h2o_socket_close(sock);
+            continue;
+        }
+#endif
         if (listener_config->sndbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_SNDBUF, &listener_config->sndbuf,
                                                        sizeof(listener_config->sndbuf)) != 0)
             h2o_perror("failed to set SO_SNDBUF");
@@ -4735,6 +5015,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     size_t i;
 
     h2o_context_init(&conf.threads[thread_index].ctx, h2o_evloop_create(), &conf.globalconf);
+    conf.threads[thread_index].ctx.thread_index = thread_index;
     conf.threads[thread_index].ctx.http3.next_cid.node_id = conf.quic.node_id;
     conf.threads[thread_index].ctx.http3.next_cid.thread_id = (uint32_t)thread_index;
     h2o_multithread_register_receiver(conf.threads[thread_index].ctx.queue, &conf.threads[thread_index].server_notifications,
@@ -4747,6 +5028,10 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
         h2o_linklist_init_anchor(&async_nb.read_queue.anchor);
         h2o_linklist_init_anchor(&async_nb.write_queue.anchor);
     }
+#if H2O_USE_EPOLL_BUSYPOLL
+    size_t queue = 0;
+    const struct busypoll_nic_t *nic = get_worker_nic(thread_index, &queue);
+#endif
     if (conf.thread_map.entries[thread_index] >= 0) {
 #if H2O_HAS_PTHREAD_SETAFFINITY_NP
         int r;
@@ -4770,6 +5055,13 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
         r = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set);
 #endif
         if (r != 0) {
+#if H2O_USE_EPOLL_BUSYPOLL
+            if (nic != NULL) {
+                fprintf(stderr, "busy-poll-map: failed to bind worker %zu to CPU %d: %s\n", thread_index,
+                        conf.thread_map.entries[thread_index], strerror(r));
+                _exit(EX_CONFIG);
+            }
+#endif
             static int once;
             if (__sync_fetch_and_add(&once, 1) == 0) {
                 fprintf(stderr, "[warning] failed to set bind to CPU:%d\n", conf.thread_map.entries[thread_index]);
@@ -4779,6 +5071,15 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
         h2o_fatal("internal error; thread pinning not available even though specified");
 #endif
     }
+
+#if H2O_USE_EPOLL_BUSYPOLL
+    if (nic != NULL &&
+        h2o_busypoll_init_worker(conf.threads[thread_index].ctx.loop, nic, queue, &conf.busypoll.epoll_params) != 0) {
+        fprintf(stderr, "busy-poll-map: failed to configure epoll for %s RX queue %zu: %s\n", nic->iface.base, queue,
+                strerror(errno));
+        _exit(EX_CONFIG);
+    }
+#endif
 
     /* setup listeners */
     for (i = 0; i != conf.num_listeners; ++i) {
@@ -4791,7 +5092,13 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
             listeners[i].accept_ctx.ssl_ctx = listener_config->ssl.entries[0]->identities[0].ossl;
             listeners[i].accept_ctx.http2_origin_frame = listener_config->ssl.entries[0]->http2_origin_frame;
         }
-        listeners[i].sock = h2o_evloop_socket_create(conf.threads[thread_index].ctx.loop, fd, H2O_SOCKET_FLAG_DONT_READ);
+        int flags = H2O_SOCKET_FLAG_DONT_READ;
+#if H2O_USE_EPOLL_BUSYPOLL
+        if (nic != NULL && nic->mode != BP_MODE_OFF && listener_config->addr.ss_family != AF_UNIX &&
+            listener_config->quic.ctx == NULL)
+            flags |= H2O_SOCKET_FLAG_IS_BUSYPOLL_LISTENER;
+#endif
+        listeners[i].sock = h2o_evloop_socket_create(conf.threads[thread_index].ctx.loop, fd, flags);
         listeners[i].sock->data = listeners + i;
         /* setup quic context and the unix socket to receive forwarded packets */
         if (thread_index < conf.quic.num_threads && listener_config->quic.ctx != NULL) {
@@ -4832,6 +5139,11 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
         h2o_set_signal_handler(SIGTERM, on_sigterm_set_flag_notify_threads);
         if (conf.shutdown_requested)
             exit(0);
+#if H2O_USE_EPOLL_BUSYPOLL
+        /* apply interface settings with final worker credentials after epoll setup */
+        if (h2o_busypoll_apply_options(&conf.busypoll.nic_to_cpu_map) != 0)
+            _exit(EX_CONFIG);
+#endif
         fprintf(stderr, "h2o server (pid:%d) is ready to serve requests with %zu threads\n", (int)getpid(), conf.thread_map.size);
     }
 
@@ -4878,6 +5190,10 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
     /* remove the pid file */
     if (conf.pid_file != NULL)
         unlink(conf.pid_file);
+
+#if H2O_USE_EPOLL_BUSYPOLL
+    h2o_busypoll_restore_options(&conf.busypoll.nic_to_cpu_map);
+#endif
 
     /* Use `_exit` to prevent functions registered via `atexit` from being invoked, otherwise we might see some threads die while
      * trying to use whatever state that are cleaned up. Specifically, we see the ticket updater thread dying inside RAND_bytes,
@@ -5183,6 +5499,29 @@ static void setup_configurators(void)
         h2o_configurator_define_command(c, "io_uring-batch-size",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_io_uring_batch_size);
+#if H2O_USE_EPOLL_BUSYPOLL
+        h2o_configurator_define_command(c, "epoll-nonblock", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_epoll_nonblock);
+        h2o_configurator_define_command(c, "epoll-prefer-bp", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_epoll_prefer_bp);
+        h2o_configurator_define_command(c, "busy-poll-budget", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_busy_poll_budget);
+        h2o_configurator_define_command(c, "busy-poll-usecs", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_busy_poll_usecs);
+        h2o_configurator_define_command(c, "busy-poll-map", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING,
+                                        on_busy_poll_map);
+#else
+        h2o_configurator_define_command(c, "epoll-nonblock", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_busypoll_unsupported);
+        h2o_configurator_define_command(c, "epoll-prefer-bp", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_busypoll_unsupported);
+        h2o_configurator_define_command(c, "busy-poll-budget", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_busypoll_unsupported);
+        h2o_configurator_define_command(c, "busy-poll-usecs", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_busypoll_unsupported);
+        h2o_configurator_define_command(c, "busy-poll-map", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING,
+                                        on_busypoll_unsupported);
+#endif
         h2o_configurator_define_command(c, "acme", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING,
                                         on_config_acme);
     }
@@ -5240,8 +5579,13 @@ static int dup_listener(struct listener_config_t *config)
             char buf[256];
             h2o_fatal("failed to obtain local address of a listening socket: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
         }
-        if ((fd = open_listener(ss.ss_family, type, type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP, (struct sockaddr *)&ss,
-                                sslen)) != -1) {
+        int protocol = type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP;
+#if H2O_WITH_MPTCP
+        socklen_t protocol_len = sizeof(protocol);
+        if (getsockopt(config->fds.entries[0], SOL_SOCKET, SO_PROTOCOL, &protocol, &protocol_len) != 0)
+            h2o_fatal("failed to obtain listener protocol: %s", strerror(errno));
+#endif
+        if ((fd = open_listener(ss.ss_family, type, protocol, (struct sockaddr *)&ss, sslen, config->fds.size)) != -1) {
             if (type == SOCK_DGRAM)
                 set_quic_sockopts(fd, ss.ss_family, config->sndbuf, config->rcvbuf);
         } else {
@@ -5374,6 +5718,9 @@ int main(int argc, char **argv)
 #if H2O_USE_IO_URING
                 printf("io_uring: YES\n");
 #endif
+#if H2O_USE_EPOLL_BUSYPOLL
+                printf("epoll_busypoll: YES\n");
+#endif
 #if H2O_WITH_MPTCP
                 printf("mptcp: YES\n");
 #endif
@@ -5456,6 +5803,10 @@ int main(int argc, char **argv)
             exit(EX_CONFIG);
         if (h2o_configurator_apply(&conf.globalconf, conf.yoml, conf.run_mode != RUN_MODE_WORKER) != 0)
             exit(EX_CONFIG);
+#if H2O_USE_EPOLL_BUSYPOLL
+        if (validate_busypoll_config() != 0)
+            return EX_CONFIG;
+#endif
         dispose_resolve_tag_arg(&resolve_tag_arg);
         yoml_free(conf.yoml, NULL);
         conf.yoml = NULL;

@@ -448,6 +448,68 @@ Output of the lego command (including errors) are emitted to the error log of h2
 
 <?
 $ctx->{directive}->(
+    name   => "busy-poll-map",
+    levels => [ qw(global) ],
+    desc   => q{Assigns Linux TCP listeners to interfaces and pins their workers to CPUs.},
+)->(sub {
+?>
+<p>
+Build the standalone server with <code>WITH_EPOLL_BUSYPOLL</code>, libynl with generated Linux netdev queue and NAPI bindings, and a libc that provides <code>epoll_pwait2</code>.
+Check for <code>epoll_busypoll: YES</code> in <code>h2o --version</code>.
+Run a standalone worker process with <code>tcp-reuseport: ON</code>. This process must own the listener group and the mapped queues.
+Each entry in <code>interfaces</code> names a device by its <code>ifindex</code> and lists Linux CPU IDs in RX queue order, starting with queue 0.
+Use <code>ip link show</code> to find the interface index.
+For active polling, supply one available CPU for each RX queue and use a driver that reports a distinct NAPI ID for each RX queue.
+</p>
+<p>
+H2O assigns workers in the order of the interfaces and queues in the map. An explicit CPU list in <code>num-threads</code> must start with these same CPU IDs.
+Any remaining workers use ordinary epoll and can accept traffic from other interfaces, including loopback.
+Active polling supports TCP listeners. If an accepted connection has an unknown or different NAPI ID, H2O logs a warning and switches that worker to ordinary epoll.
+A worker also switches to ordinary epoll when it opens an outbound IP socket, such as a connection to a reverse-proxy upstream, or imports an IP socket into its event loop.
+The worker continues serving connections in this mode.
+</p>
+<p>
+Set <code>options.mode</code> to <code>BUSYPOLL</code> for epoll busy polling, <code>SUSPEND</code> for IRQ suspension, or <code>OFF</code> to route the interface to workers using ordinary epoll.
+Active modes accept per-NAPI <code>gro-flush-timeout</code> in nanoseconds and <code>defer-hard-irqs</code> in consecutive empty polls.
+For IRQ suspension, configure a positive <code>suspend-timeout</code> in nanoseconds or set it on the device before startup.
+Changing NAPI settings requires <code>CAP_NET_ADMIN</code>. H2O restores the previous values of explicitly configured settings at graceful shutdown. Omitted settings retain the device's values.
+During <code>h2o -t</code> H2O reads the device's queues and NAPI IDs. Worker startup applies the requested NAPI settings.
+See the <a href="https://docs.kernel.org/networking/napi.html#epoll-based-busy-polling">Linux NAPI documentation</a> for kernel configuration.
+</p>
+<?= $ctx->{example}->('Two RX queues on interface 2, with a third worker for other interfaces', <<'EOT')
+tcp-reuseport: ON
+num-threads: [2, 3, 1]
+busy-poll-usecs: 50
+busy-poll-map:
+  interfaces:
+    - ifindex: 2
+      cpus: [2, 3]
+      options:
+        mode: BUSYPOLL
+EOT
+?>
+? })
+
+<?
+$ctx->{directive}->(
+    name    => "busy-poll-budget",
+    levels  => [ qw(global) ],
+    desc    => q{Sets the maximum number of packets per NAPI poll on an active busy-poll worker. Zero uses the kernel default.},
+    default => "busy-poll-budget: 0",
+)->(sub {});
+?>
+
+<?
+$ctx->{directive}->(
+    name    => "busy-poll-usecs",
+    levels  => [ qw(global) ],
+    desc    => q{Sets the busy-poll duration in microseconds for each active worker's epoll instance. Zero uses the system busy-poll setting.},
+    default => "busy-poll-usecs: 0",
+)->(sub {});
+?>
+
+<?
+$ctx->{directive}->(
     name   => "capabilities",
     levels => [ qw(global) ],
     desc   => "Set capabilities to be added to the process before dropping root privileges.",
@@ -459,6 +521,24 @@ The argument is a YAML sequence of capabilites, where each capability is a name 
 See <code>man 7 capabilities</code> for details.
 </p>
 ? })
+
+<?
+$ctx->{directive}->(
+    name    => "epoll-nonblock",
+    levels  => [ qw(global) ],
+    desc    => q{Makes active polling workers call epoll repeatedly with a minimal timeout when idle. This can consume a full CPU per worker.},
+    default => "epoll-nonblock: OFF",
+)->(sub {});
+?>
+
+<?
+$ctx->{directive}->(
+    name    => "epoll-prefer-bp",
+    levels  => [ qw(global) ],
+    desc    => q{Asks the kernel to prefer busy polling over device interrupts on active workers. SUSPEND mode enables this preference automatically.},
+    default => "epoll-prefer-bp: OFF",
+)->(sub {});
+?>
 
 <?
 $ctx->{directive}->(

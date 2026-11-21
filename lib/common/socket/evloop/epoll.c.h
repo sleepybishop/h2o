@@ -26,11 +26,28 @@
 #if H2O_USE_IO_URING
 #include "h2o/io_uring.h"
 #endif
+#if H2O_USE_EPOLL_BUSYPOLL
+#include <sys/ioctl.h>
+#include "h2o/busypoll.h"
+#endif
 
 #if 0
 #define DEBUG_LOG(...) h2o_error_printf(__VA_ARGS__)
 #else
 #define DEBUG_LOG(...)
+#endif
+
+#if H2O_USE_EPOLL_BUSYPOLL
+/* linux 6.9 epoll ABI for older libc headers */
+#ifndef EPIOCSPARAMS
+struct epoll_params {
+    uint32_t busy_poll_usecs;
+    uint16_t busy_poll_budget;
+    uint8_t prefer_busy_poll;
+    uint8_t __pad;
+};
+#define EPIOCSPARAMS _IOW(0x8A, 0x01, struct epoll_params)
+#endif
 #endif
 
 struct st_h2o_evloop_epoll_t {
@@ -39,7 +56,30 @@ struct st_h2o_evloop_epoll_t {
 #if H2O_USE_IO_URING
     h2o_io_uring_t io_uring;
 #endif
+#if H2O_USE_EPOLL_BUSYPOLL
+    unsigned busypoll_enabled : 1;
+    unsigned busypoll_nonblock : 1;
+#endif
 };
+
+#if H2O_USE_EPOLL_BUSYPOLL
+static void check_busypoll_registration(struct st_h2o_evloop_epoll_t *loop, struct st_h2o_evloop_socket_t *sock)
+{
+    /* accepted TCP sockets are checked on accept; other IP sockets may use another NAPI */
+    if (sock->_flags & (H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION | H2O_SOCKET_FLAG_IS_BUSYPOLL_LISTENER))
+        return;
+    int domain;
+    socklen_t len = sizeof(domain);
+    if (getsockopt(sock->fd, SOL_SOCKET, SO_DOMAIN, &domain, &len) == 0) {
+        if (domain != AF_INET && domain != AF_INET6)
+            return;
+    } else if (errno == ENOTSOCK) {
+        return;
+    }
+    if (h2o_busypoll_disable_worker(&loop->super, "registering an unsteered socket") != 0)
+        h2o_fatal("cannot disable busy polling before registering fd %d: %s", sock->fd, strerror(errno));
+}
+#endif
 
 static int change_epoll_mode(struct st_h2o_evloop_socket_t *sock, uint32_t events)
 {
@@ -48,6 +88,10 @@ static int change_epoll_mode(struct st_h2o_evloop_socket_t *sock, uint32_t event
     int op, ret;
 
     if ((sock->_flags & H2O_SOCKET_FLAG__EPOLL_IS_REGISTERED) == 0) {
+#if H2O_USE_EPOLL_BUSYPOLL
+        if (loop->busypoll_enabled)
+            check_busypoll_registration(loop, sock);
+#endif
         op = EPOLL_CTL_ADD;
     } else {
         op = EPOLL_CTL_MOD;
@@ -208,7 +252,17 @@ int evloop_do_proceed(h2o_evloop_t *_loop, int32_t max_wait)
 
     /* poll */
     max_wait = adjust_max_wait(&loop->super, max_wait);
-    nevents = epoll_wait(loop->ep, events, sizeof(events) / sizeof(events[0]), max_wait);
+#if H2O_USE_EPOLL_BUSYPOLL
+    if (loop->busypoll_nonblock && max_wait != 0) {
+        /* zero timeout skips NAPI polling; 1 ns polls without adding an idle wait */
+        const struct timespec timeout = {.tv_nsec = 1};
+        nevents = epoll_pwait2(loop->ep, events, PTLS_ELEMENTSOF(events), &timeout, NULL);
+    } else
+#endif
+    {
+        nevents = epoll_wait(loop->ep, events, PTLS_ELEMENTSOF(events), max_wait);
+    }
+
     update_now(&loop->super);
     if (nevents == -1)
         return -1;
@@ -344,5 +398,31 @@ struct st_h2o_io_uring_t *h2o_evloop__io_uring(h2o_evloop_t *_loop)
 {
     struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)_loop;
     return &loop->io_uring;
+}
+#endif
+
+#if H2O_USE_EPOLL_BUSYPOLL
+int h2o_evloop_set_busypoll(h2o_loop_t *_loop, enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *settings)
+{
+    struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)_loop;
+    struct epoll_params params = {0};
+
+    if (mode >= BP_MODE_NUM) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (mode == BP_MODE_OFF) {
+        if (!loop->busypoll_enabled)
+            return 0;
+    } else {
+        params.busy_poll_usecs = settings->usecs;
+        params.busy_poll_budget = settings->budget;
+        params.prefer_busy_poll = settings->prefer || mode == BP_MODE_SUSPEND;
+    }
+    if (ioctl(loop->ep, EPIOCSPARAMS, &params) == -1)
+        return -1;
+    loop->busypoll_enabled = mode != BP_MODE_OFF;
+    loop->busypoll_nonblock = loop->busypoll_enabled && settings->nonblock;
+    return 0;
 }
 #endif

@@ -676,6 +676,10 @@ struct st_h2o_context_t {
      */
     h2o_loop_t *loop;
     /**
+     * index of the worker serving this context, set by the server
+     */
+    size_t thread_index;
+    /**
      * pointer to the global configuration
      */
     h2o_globalconf_t *globalconf;
