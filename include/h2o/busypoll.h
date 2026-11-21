@@ -37,6 +37,8 @@ struct busypoll_nic_t {
 
 typedef H2O_VECTOR(struct busypoll_nic_t) h2o_busypoll_nic_vector_t;
 
+/* returns diagnostic on failure with errno set */
+const char *h2o_evloop_validate_busypoll(enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *params);
 int h2o_evloop_set_busypoll(h2o_loop_t *loop, enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *params);
 int h2o_busypoll_attach_cbpf(int fd, unsigned group_size);
 int h2o_busypoll_attach_partial_map(int fd, const h2o_busypoll_nic_vector_t *nics, size_t num_workers);

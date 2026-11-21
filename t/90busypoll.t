@@ -38,8 +38,8 @@ sub config_file {
 }
 
 sub check_config {
-    my ($label, $globals, $error) = @_;
-    my ($status, $result) = capture($h2o, '-t', '-c', config_file("listen: 8080\n$host$globals"));
+    my ($label, $globals, $error, @prefix) = @_;
+    my ($status, $result) = capture(@prefix, $h2o, '-t', '-c', config_file("listen: 8080\n$host$globals"));
     if (defined $error) {
         isnt $status, 0, "$label is rejected";
         like $result, $error, "$label diagnostic";
@@ -85,8 +85,18 @@ subtest 'configuration test' => sub {
     my $entry = map_nic($ifindex, $cpu[0], 'OFF');
     my $valid = mapped_config(1, $entry);
     check_config('one mapped worker', $valid);
-    check_config('loopback lacks a pollable queue', mapped_config(1, map_nic($ifindex, $cpu[0], 'BUSYPOLL')),
-                 qr/queue|NAPI|netlink/i);
+    my $active = mapped_config(1, map_nic($ifindex, $cpu[0], 'BUSYPOLL'));
+    check_config('active polling on loopback', $active, qr/queue|NAPI|netlink|epoll busy-poll parameters/i);
+    my $large_budget = "busy-poll-budget: 65535\n";
+    check_config('OFF with an inactive polling budget', $large_budget . $valid);
+    SKIP: {
+        skip 'setpriv needed to check kernel budget limits without CAP_NET_ADMIN', 2 unless prog_exists('setpriv');
+        my @unprivileged = ('setpriv', '--no-new-privs', '--ambient-caps=-net_admin');
+        push @unprivileged, '--bounding-set=-net_admin' if $> == 0;
+        # Epoll validates global parameters on a private fd before H2O queries this interface's queues.
+        check_config('unprivileged active polling with a large budget', $large_budget . $active,
+                     qr/cannot set epoll busy-poll parameters/i, @unprivileged);
+    }
     check_config('invalid interface mode', mapped_config(1, map_nic($ifindex, $cpu[0], 'OTHER')), qr/BUSYPOLL/i);
     check_config('suspend timeout outside SUSPEND', mapped_config(1, map_nic($ifindex, $cpu[0], 'BUSYPOLL',
                  "        suspend-timeout: 10000\n")), qr/suspend/i);
@@ -95,7 +105,6 @@ subtest 'configuration test' => sub {
     check_config('unknown interface', mapped_config(1, map_nic(0, $cpu[0], 'OFF')), qr/interface/i);
     check_config('negative CPU', mapped_config(1, map_nic($ifindex, -1, 'OFF')), qr/integer/i);
     for my $protocol (qw(quic mptcp)) {
-        my $active = mapped_config(1, map_nic($ifindex, $cpu[0], 'BUSYPOLL'));
         check_config("active polling with $protocol", "listen: {port: 8081, type: $protocol}\n$active",
                      qr/type $protocol does not support single-NAPI/i);
     }
@@ -266,6 +275,12 @@ subtest 'isolated netdevsim traffic' => sub {
             push @test_cmd, 'setpriv', '--bounding-set=-net_admin' if prog_exists('setpriv');
             my ($status, $result) = capture(@test_cmd, $h2o, '-t', '-c', $file);
             is $status, 0, 'configuration validates without changing the device' or diag $result;
+            if ($mode eq 'BUSYPOLL' && $nonblock eq 'OFF' && prog_exists('setpriv')) {
+                (my $large_budget = $conf) =~ s/busy-poll-budget: 16/busy-poll-budget: 65535/;
+                my ($status, $result) = capture(@test_cmd, $h2o, '-t', '-c', config_file($large_budget));
+                isnt $status, 0, 'valid queue map cannot bypass the kernel polling budget limit';
+                like $result, qr/cannot set epoll busy-poll parameters/i, 'reports the epoll failure on a valid queue map';
+            }
             my $url = 'http://127.0.0.1:8080/index.txt';
             my @curl = qw(curl --noproxy * --fail --silent --show-error --max-time 4);
             my $server = spawn_server(argv => ['ip','netns','exec',$sv,$h2o,'-c',$file],

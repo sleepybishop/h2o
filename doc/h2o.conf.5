@@ -916,7 +916,8 @@ Set options.mode to BUSYPOLL for epoll busy polling, SUSPEND for IRQ suspension,
 Active modes accept per-NAPI gro-flush-timeout in nanoseconds and defer-hard-irqs in consecutive empty polls.
 For IRQ suspension, configure a positive suspend-timeout in nanoseconds or set it on the device before startup.
 Changing NAPI settings requires CAP_NET_ADMIN. H2O restores the previous values of explicitly configured settings at graceful shutdown. Omitted settings retain the device's values.
-During h2o -t H2O reads the device's queues and NAPI IDs. Worker startup applies the requested NAPI settings.
+During h2o -t H2O checks active polling parameters on a temporary epoll descriptor using the invoking process's credentials and reads the device's queues and NAPI IDs.
+At startup, workers apply their epoll and NAPI settings with their final credentials.
 See the Linux NAPI documentation for kernel configuration.
 
 .PP

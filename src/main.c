@@ -4218,8 +4218,18 @@ static int validate_busypoll_config(void)
             conf.thread_map.entries[worker] = cpu;
         }
     }
+    int checked_modes[BP_MODE_NUM] = {0};
     for (size_t i = 0; i != conf.busypoll.nic_to_cpu_map.size; ++i) {
-        if (h2o_busypoll_discover_queues(conf.busypoll.nic_to_cpu_map.entries + i) != 0)
+        struct busypoll_nic_t *nic = conf.busypoll.nic_to_cpu_map.entries + i;
+        if (conf.run_mode == RUN_MODE_TEST && nic->mode != BP_MODE_OFF && !checked_modes[nic->mode]) {
+            const char *err = h2o_evloop_validate_busypoll(nic->mode, &conf.busypoll.epoll_params);
+            if (err != NULL) {
+                fprintf(stderr, "busy-poll-map: %s for %s: %s\n", err, nic->iface.base, strerror(errno));
+                return -1;
+            }
+            checked_modes[nic->mode] = 1;
+        }
+        if (h2o_busypoll_discover_queues(nic) != 0)
             return -1;
     }
     return 0;

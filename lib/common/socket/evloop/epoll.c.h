@@ -402,24 +402,40 @@ struct st_h2o_io_uring_t *h2o_evloop__io_uring(h2o_evloop_t *_loop)
 #endif
 
 #if H2O_USE_EPOLL_BUSYPOLL
-int h2o_evloop_set_busypoll(h2o_loop_t *_loop, enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *settings)
+static int set_busypoll_params(int ep, enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *settings)
 {
-    struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)_loop;
     struct epoll_params params = {0};
 
     if (mode >= BP_MODE_NUM) {
         errno = EINVAL;
         return -1;
     }
-    if (mode == BP_MODE_OFF) {
-        if (!loop->busypoll_enabled)
-            return 0;
-    } else {
+    if (mode != BP_MODE_OFF) {
         params.busy_poll_usecs = settings->usecs;
         params.busy_poll_budget = settings->budget;
         params.prefer_busy_poll = settings->prefer || mode == BP_MODE_SUSPEND;
     }
-    if (ioctl(loop->ep, EPIOCSPARAMS, &params) == -1)
+    return ioctl(ep, EPIOCSPARAMS, &params);
+}
+
+const char *h2o_evloop_validate_busypoll(enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *settings)
+{
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep == -1)
+        return "cannot create epoll descriptor";
+    int ret = set_busypoll_params(ep, mode, settings);
+    int saved_errno = errno;
+    close(ep);
+    errno = saved_errno;
+    return ret == -1 ? "cannot set epoll busy-poll parameters" : NULL;
+}
+
+int h2o_evloop_set_busypoll(h2o_loop_t *_loop, enum en_h2o_bp_mode_t mode, const struct busypoll_epoll_params *settings)
+{
+    struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)_loop;
+    if (mode == BP_MODE_OFF && !loop->busypoll_enabled)
+        return 0;
+    if (set_busypoll_params(loop->ep, mode, settings) == -1)
         return -1;
     loop->busypoll_enabled = mode != BP_MODE_OFF;
     loop->busypoll_nonblock = loop->busypoll_enabled && settings->nonblock;
